@@ -1,0 +1,9 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.DanKaten/avenity-agentic-audit",
+  "title": "Avenity AI Visibility",
+  "description": "Hireable AI-visibility service: get a business named in AI answers. Free audit + x402 hire.",
+  "repository": { "url": "https://github.com/DanKaten/avenity-agentic-audit", "source": "github" },
+  "version": "1.0.0",
+  "remotes": [ { "type": "streamable-http", "url": "https://avenity-agentic-audit.onrender.com/mcp" } ]
+}
