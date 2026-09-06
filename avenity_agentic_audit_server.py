@@ -28,7 +28,7 @@ import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
-from x402.http import HTTPFacilitatorClient, FacilitatorConfig
+from x402.http import HTTPFacilitatorClient, FacilitatorConfig, CreateHeadersAuthProvider
 
 mcp = FastMCP(
     name="avenity-ai-visibility",
@@ -85,6 +85,35 @@ def run_visibility_scan(business: str, category: str, location: str) -> dict:
 
 
 # ---- x402 payment verification ---------------------------------------------------
+def _build_facilitator_client():
+    """
+    Build the x402 facilitator client used to verify/settle payments.
+
+    If CDP_API_KEY_ID and CDP_API_KEY_SECRET (Coinbase Developer Platform credentials)
+    are set, use Coinbase's authenticated facilitator -- the only one that supports Base
+    mainnet. Otherwise fall back to the public x402.org facilitator (AVENITY_X402_FACILITATOR),
+    which only supports testnets (base-sepolia, etc.) and is fine for development.
+
+    Returns (client, facilitator_url) so callers can report which facilitator was used.
+    """
+    cdp_key_id = os.environ.get("CDP_API_KEY_ID")
+    cdp_key_secret = os.environ.get("CDP_API_KEY_SECRET")
+    if cdp_key_id and cdp_key_secret:
+        try:
+            from cdp.x402.x402 import create_facilitator_config as _cdp_facilitator_config
+            cdp_config = _cdp_facilitator_config(cdp_key_id, cdp_key_secret)
+            client = HTTPFacilitatorClient(FacilitatorConfig(
+                url=cdp_config["url"],
+                auth_provider=CreateHeadersAuthProvider(cdp_config["create_headers"]),
+            ))
+            return client, cdp_config["url"]
+        except Exception as e:
+            # Don't take payment processing down if the CDP SDK is missing or
+            # misconfigured -- fall back to the public facilitator instead.
+            print(f"CDP facilitator unavailable ({e}); falling back to public facilitator.")
+    return HTTPFacilitatorClient(FacilitatorConfig(url=X402_FACILITATOR)), X402_FACILITATOR
+
+
 def _decode_payment_proof(payment_proof: str) -> bytes:
     """
     The x402 protocol carries payment proof as the X-PAYMENT header value: base64-encoded
@@ -211,20 +240,24 @@ async def purchase_engagement(
         "maxTimeoutSeconds": 300,
     }
 
+    facilitator, facilitator_url = _build_facilitator_client()
+
     if not payment_proof:
         # x402: 402 Payment Required — the agent's wallet reads this and pays.
+        await facilitator.aclose()
         return {
             "status": "payment_required",
             "http_status": 402,
             "x402Version": 1,
             "accepts": [requirements_dict],
-            "facilitator": X402_FACILITATOR,
+            "facilitator": facilitator_url,
             "resubmit": "call purchase_engagement again with payment_proof set to the X-PAYMENT payload",
         }
 
     try:
         payload_bytes = _decode_payment_proof(payment_proof)
     except (ValueError, binascii.Error, json.JSONDecodeError):
+        await facilitator.aclose()
         return {
             "status": "payment_invalid",
             "http_status": 402,
@@ -234,11 +267,10 @@ async def purchase_engagement(
                 "X-PAYMENT header value produced by the paying agent's wallet."
             ),
             "accepts": [requirements_dict],
-            "facilitator": X402_FACILITATOR,
+            "facilitator": facilitator_url,
         }
 
     requirements_bytes = json.dumps(requirements_dict).encode("utf-8")
-    facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=X402_FACILITATOR))
     try:
         try:
             verify_result = await facilitator.verify_from_bytes(payload_bytes, requirements_bytes)
@@ -247,7 +279,7 @@ async def purchase_engagement(
                 "status": "payment_verification_error",
                 "http_status": 502,
                 "message": f"Could not reach the x402 facilitator to verify payment: {e}",
-                "facilitator": X402_FACILITATOR,
+                "facilitator": facilitator_url,
             }
 
         if not verify_result.is_valid:
@@ -257,7 +289,7 @@ async def purchase_engagement(
                 "reason": verify_result.invalid_reason,
                 "message": verify_result.invalid_message or "Payment could not be verified.",
                 "accepts": [requirements_dict],
-                "facilitator": X402_FACILITATOR,
+                "facilitator": facilitator_url,
             }
 
         # Verified -- settle it on-chain via the same facilitator before confirming.
@@ -268,7 +300,7 @@ async def purchase_engagement(
                 "status": "settlement_error",
                 "http_status": 502,
                 "message": f"Payment verified but settlement failed: {e}",
-                "facilitator": X402_FACILITATOR,
+                "facilitator": facilitator_url,
             }
     finally:
         await facilitator.aclose()
@@ -279,7 +311,7 @@ async def purchase_engagement(
             "http_status": 402,
             "reason": settle_result.error_reason,
             "message": settle_result.error_message or "Settlement failed.",
-            "facilitator": X402_FACILITATOR,
+            "facilitator": facilitator_url,
         }
 
     order = {
