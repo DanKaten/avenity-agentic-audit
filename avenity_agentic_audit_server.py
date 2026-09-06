@@ -17,15 +17,18 @@ DAN'S TWO PLUG-INS (I never touch keys):
   2. run_visibility_scan()    -> point at your avenity-visibility-mcp for the real live scan.
                                 A working search-based fallback is included so it runs today.
 
-Run:  pip install fastmcp httpx  &&  python avenity_agentic_audit_server.py
+Run:  pip install fastmcp httpx x402  &&  python avenity_agentic_audit_server.py
 """
 
 import os
 import json
+import base64
+import binascii
 import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
+from x402.http import HTTPFacilitatorClient, FacilitatorConfig
 
 mcp = FastMCP(
     name="avenity-ai-visibility",
@@ -79,6 +82,26 @@ def run_visibility_scan(business: str, category: str, location: str) -> dict:
         }
     except Exception as e:  # pragma: no cover
         return {"engine": "error", "named": None, "competitors_named": [], "note": str(e)}
+
+
+# ---- x402 payment verification ---------------------------------------------------
+def _decode_payment_proof(payment_proof: str) -> bytes:
+    """
+    The x402 protocol carries payment proof as the X-PAYMENT header value: base64-encoded
+    JSON. Some callers may instead pass the already-decoded JSON string. Accept either and
+    return the raw JSON bytes the facilitator client expects.
+    """
+    raw = payment_proof.strip()
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+        json.loads(decoded)  # confirm the decoded bytes are actually JSON
+        return decoded
+    except (binascii.Error, ValueError, json.JSONDecodeError):
+        pass
+    # Fall back: treat it as raw JSON text. Raises ValueError/JSONDecodeError if invalid,
+    # which the caller catches and reports as a malformed payment_proof.
+    json.loads(raw)
+    return raw.encode("utf-8")
 
 
 # ---- Tools agents can call ------------------------------------------------------
@@ -146,7 +169,7 @@ def request_engagement_quote(
 
 
 @mcp.tool()
-def purchase_engagement(
+async def purchase_engagement(
     business_name: str,
     categories: list[str],
     tier: str = "local",
@@ -155,18 +178,38 @@ def purchase_engagement(
 ) -> dict:
     """
     Hire Avenity. x402-GATED: without valid payment_proof this returns HTTP-402-shaped
-    payment requirements (pay to Avenity's wallet). With valid payment_proof, it settles
-    via the facilitator, records the order, and confirms the engagement.
+    payment requirements (pay to Avenity's wallet). With payment_proof, it is verified
+    and settled against the x402 facilitator before the engagement is confirmed — an
+    engagement is only ever marked "acquired" after the facilitator confirms the payment
+    actually settled on-chain.
 
     Args:
         business_name: client being engaged.
         categories: the categories/product lines to get named for.
         tier: pricing tier (see request_engagement_quote).
         contact: optional human contact for onboarding.
-        payment_proof: the x402 payment payload/settlement token from the agent's wallet.
+        payment_proof: the x402 payment payload/settlement token from the agent's wallet
+            (the X-PAYMENT header value: base64-encoded JSON).
     """
-    price = PRICES.get(tier.lower(), PRICES["local"])
+    tier = tier.lower()
+    price = PRICES.get(tier, PRICES["local"])
     amount_atomic = str(price * 1_000_000)  # USDC 6 decimals
+    resource = f"avenity:engagement:{tier}"
+
+    # These requirements must be byte-identical to what the facilitator verifies the
+    # payment against, so they're built once and reused for both the 402 challenge and
+    # the later verify/settle calls.
+    requirements_dict = {
+        "scheme": "exact",
+        "network": X402_NETWORK,
+        "maxAmountRequired": amount_atomic,
+        "asset": X402_ASSET,
+        "payTo": WALLET_ADDRESS,
+        "resource": resource,
+        "description": f"Avenity AI-visibility engagement ({tier}) for {business_name}",
+        "mimeType": "application/json",
+        "maxTimeoutSeconds": 300,
+    }
 
     if not payment_proof:
         # x402: 402 Payment Required — the agent's wallet reads this and pays.
@@ -174,22 +217,71 @@ def purchase_engagement(
             "status": "payment_required",
             "http_status": 402,
             "x402Version": 1,
-            "accepts": [{
-                "scheme": "exact",
-                "network": X402_NETWORK,
-                "maxAmountRequired": amount_atomic,
-                "asset": X402_ASSET,
-                "payTo": WALLET_ADDRESS,
-                "resource": f"avenity:engagement:{tier}",
-                "description": f"Avenity AI-visibility engagement ({tier}) for {business_name}",
-                "mimeType": "application/json",
-                "maxTimeoutSeconds": 300,
-            }],
+            "accepts": [requirements_dict],
             "facilitator": X402_FACILITATOR,
             "resubmit": "call purchase_engagement again with payment_proof set to the X-PAYMENT payload",
         }
 
-    # Settlement path (verify via facilitator in production).
+    try:
+        payload_bytes = _decode_payment_proof(payment_proof)
+    except (ValueError, binascii.Error, json.JSONDecodeError):
+        return {
+            "status": "payment_invalid",
+            "http_status": 402,
+            "reason": "malformed_payment_proof",
+            "message": (
+                "payment_proof could not be parsed as an x402 payment payload. Expected the "
+                "X-PAYMENT header value produced by the paying agent's wallet."
+            ),
+            "accepts": [requirements_dict],
+            "facilitator": X402_FACILITATOR,
+        }
+
+    requirements_bytes = json.dumps(requirements_dict).encode("utf-8")
+    facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=X402_FACILITATOR))
+    try:
+        try:
+            verify_result = await facilitator.verify_from_bytes(payload_bytes, requirements_bytes)
+        except Exception as e:
+            return {
+                "status": "payment_verification_error",
+                "http_status": 502,
+                "message": f"Could not reach the x402 facilitator to verify payment: {e}",
+                "facilitator": X402_FACILITATOR,
+            }
+
+        if not verify_result.is_valid:
+            return {
+                "status": "payment_invalid",
+                "http_status": 402,
+                "reason": verify_result.invalid_reason,
+                "message": verify_result.invalid_message or "Payment could not be verified.",
+                "accepts": [requirements_dict],
+                "facilitator": X402_FACILITATOR,
+            }
+
+        # Verified -- settle it on-chain via the same facilitator before confirming.
+        try:
+            settle_result = await facilitator.settle_from_bytes(payload_bytes, requirements_bytes)
+        except Exception as e:
+            return {
+                "status": "settlement_error",
+                "http_status": 502,
+                "message": f"Payment verified but settlement failed: {e}",
+                "facilitator": X402_FACILITATOR,
+            }
+    finally:
+        await facilitator.aclose()
+
+    if not settle_result.success:
+        return {
+            "status": "settlement_failed",
+            "http_status": 402,
+            "reason": settle_result.error_reason,
+            "message": settle_result.error_message or "Settlement failed.",
+            "facilitator": X402_FACILITATOR,
+        }
+
     order = {
         "ts": datetime.datetime.utcnow().isoformat() + "Z",
         "business": business_name,
@@ -197,7 +289,9 @@ def purchase_engagement(
         "tier": tier,
         "monthly_price_usd": price,
         "contact": contact,
-        "payment_proof": payment_proof,
+        "payer": settle_result.payer,
+        "transaction": settle_result.transaction,
+        "network": settle_result.network,
         "payTo": WALLET_ADDRESS,
         "status": "acquired",
     }
