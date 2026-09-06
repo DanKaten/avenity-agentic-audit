@@ -39,6 +39,13 @@ mcp = FastMCP(
     ),
 )
 
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"ok": True, "service": "avenity-ai-visibility"})
+
 # ---- Config (Dan sets these; no secrets in code) --------------------------------
 WALLET_ADDRESS = os.environ.get("AVENITY_WALLET_ADDRESS", "0xSET_YOUR_WALLET_ADDRESS")
 X402_NETWORK   = os.environ.get("AVENITY_X402_NETWORK", "base")          # base / base-sepolia
