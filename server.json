@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.DanKaten/avenity-agentic-audit",
   "title": "Avenity Business Solutions",
-  "description": "Hire Avenity for a business owner: free AI-visibility check, report, and free consult booking.",
+  "description": "Avenity for service businesses: AI visibility, Google profile, Google/Meta/TikTok ads, free consult.",
   "repository": {
     "url": "https://github.com/DanKaten/avenity-agentic-audit",
     "source": "github"
   },
-  "version": "1.1.0",
+  "version": "1.2.0",
   "remotes": [
     {
       "type": "streamable-http",
